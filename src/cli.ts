@@ -15,6 +15,67 @@ import { logger } from "./utils/logger";
 import { conversationHistory } from "./utils/conversationHistory";
 import { z } from "zod";
 import { editIntentSchema } from "./agent";
+import { executeShellCommand, isCommandSafe } from "./commands/shell";
+import boxen from "boxen"; // We'll need to add this package
+import { diffLines } from "diff"; // We'll need to add this package
+
+function formatCodeDiff(original: string, replacement: string): string {
+  const differences = diffLines(original || "", replacement || "");
+  return differences
+    .map((part) => {
+      if (part.added) {
+        return chalk.green(
+          part.value
+            .split("\n")
+            .map((line) => `+ ${line}`)
+            .join("\n")
+        );
+      }
+      if (part.removed) {
+        return chalk.red(
+          part.value
+            .split("\n")
+            .map((line) => `- ${line}`)
+            .join("\n")
+        );
+      }
+      return chalk.dim(
+        part.value
+          .split("\n")
+          .map((line) => `  ${line}`)
+          .join("\n")
+      );
+    })
+    .join("\n");
+}
+
+function formatFilePath(file: string, lineNumber?: number | null): string {
+  return chalk.cyan(`📄 ${file}${lineNumber ? `:${lineNumber}` : ""}`);
+}
+
+function formatCommandExecution(command: string): string {
+  return boxen(chalk.yellow(`$ ${command}`), {
+    padding: 1,
+    margin: 1,
+    borderColor: "yellow",
+    title: "🔧 Executing Command",
+    titleAlignment: "center",
+  });
+}
+
+function formatEditProposal(proposal: any): string {
+  const header = chalk.cyan.bold("📝 Proposed Changes");
+  const filePath = formatFilePath(proposal.file, proposal.lineNumber);
+  const diff = formatCodeDiff(proposal.original, proposal.replacement);
+
+  return boxen(`${filePath}\n\n${diff}`, {
+    padding: 1,
+    margin: 1,
+    borderColor: "cyan",
+    title: header,
+    titleAlignment: "center",
+  });
+}
 
 const rl = readline.createInterface({ input, output });
 
@@ -102,6 +163,196 @@ console.log(chalk.green("🤖 Coding Agent ready. Type 'exit' to quit."));
           continue;
         }
 
+        // Handle shell commands directly
+        if (
+          intent.intentType === "edit" &&
+          intent.action === "shell_command" &&
+          intent.command
+        ) {
+          try {
+            // Check if the command is safe
+            const safetyCheck = isCommandSafe(intent.command);
+            if (!safetyCheck.safe) {
+              console.log(
+                boxen(chalk.red(`⚠️  ${safetyCheck.reason}`), {
+                  padding: 1,
+                  margin: 1,
+                  borderColor: "red",
+                  title: "❌ Unsafe Command",
+                  titleAlignment: "center",
+                })
+              );
+              currentEntry.outcome = "rejected";
+              currentEntry.context = `Unsafe command: ${safetyCheck.reason}`;
+              continue;
+            }
+
+            // Show command preview
+            console.log(formatCommandExecution(intent.command));
+
+            // Ask for confirmation before executing
+            const confirm = await rl.question(
+              chalk.yellow("⚡ Execute this command? [yes/no]: ")
+            );
+
+            if (confirm.toLowerCase() !== "yes") {
+              console.log(
+                boxen(chalk.yellow("Command execution cancelled by user"), {
+                  padding: 1,
+                  margin: 1,
+                  borderColor: "yellow",
+                  title: "⏹️  Cancelled",
+                  titleAlignment: "center",
+                })
+              );
+              currentEntry.outcome = "rejected";
+              currentEntry.context = "User cancelled command execution";
+              continue;
+            }
+
+            // Execute the command
+            console.log(chalk.cyan("\n📋 Command Output:"));
+            console.log(chalk.dim("─".repeat(process.stdout.columns)));
+
+            const result = await executeShellCommand(intent.command, {
+              interactive: true,
+              timeout: 60000,
+            });
+
+            console.log(chalk.dim("─".repeat(process.stdout.columns)));
+
+            if (result.exitCode === 0) {
+              console.log(
+                boxen(chalk.green("Command completed successfully"), {
+                  padding: 1,
+                  margin: 1,
+                  borderColor: "green",
+                  title: "✅ Success",
+                  titleAlignment: "center",
+                })
+              );
+              currentEntry.outcome = "accepted";
+              currentEntry.context = `Command executed: ${intent.command}`;
+            } else {
+              console.log(
+                boxen(chalk.red(`${result.stderr || result.stdout}`), {
+                  padding: 1,
+                  margin: 1,
+                  borderColor: "red",
+                  title: "❌ Error",
+                  titleAlignment: "center",
+                })
+              );
+              currentEntry.outcome = "error";
+              currentEntry.context = `Command failed: ${
+                result.stderr || result.stdout
+              }`;
+            }
+            continue;
+          } catch (error) {
+            console.log(
+              boxen(chalk.red(`${error}`), {
+                padding: 1,
+                margin: 1,
+                borderColor: "red",
+                title: "❌ Error",
+                titleAlignment: "center",
+              })
+            );
+            currentEntry.outcome = "error";
+            currentEntry.context = `Command error: ${error}`;
+            continue;
+          }
+        }
+
+        // Add after the intent extraction
+        if (
+          intent.intentType === "edit" &&
+          intent.action === "compound_action" &&
+          intent.steps
+        ) {
+          console.log(chalk.cyan("🔄 Executing compound action:"));
+
+          for (const step of intent.steps) {
+            console.log(chalk.yellow(`\n📝 Step: ${step.description}`));
+
+            if (step.action === "shell_command" && step.command) {
+              // Execute shell command
+              const safetyCheck = isCommandSafe(step.command);
+              if (!safetyCheck.safe) {
+                console.log(
+                  chalk.red(`❌ Unsafe command: ${safetyCheck.reason}`)
+                );
+                currentEntry.outcome = "rejected";
+                currentEntry.context = `Unsafe command: ${safetyCheck.reason}`;
+                continue;
+              }
+
+              console.log(chalk.yellow(`Executing: ${step.command}`));
+              const result = await executeShellCommand(step.command, {
+                interactive: true,
+                timeout: 60000,
+              });
+
+              if (result.exitCode !== 0) {
+                console.log(
+                  chalk.red(
+                    `❌ Command failed: ${result.stderr || result.stdout}`
+                  )
+                );
+                currentEntry.outcome = "error";
+                currentEntry.context = `Command failed: ${
+                  result.stderr || result.stdout
+                }`;
+                return; // Exit the entire compound action if a command fails
+              }
+            } else {
+              // Handle code changes
+              const matches = await searchCodebase(step.target, {
+                action: step.action,
+                target: step.target,
+                description: step.description,
+              });
+
+              if (matches.length === 0) {
+                console.log(chalk.red("❌ No matches found for code change."));
+                currentEntry.outcome = "error";
+                currentEntry.context = "No matches found";
+                return; // Exit the entire compound action if no matches found
+              }
+
+              const proposal = await proposeEdit(
+                {
+                  ...step,
+                  intentType: "edit",
+                } as z.infer<typeof editIntentSchema>,
+                matches[0]
+              );
+              console.log(formatEditProposal(proposal));
+
+              const confirm = await rl.question(
+                chalk.yellow("Accept this change? [yes/no]: ")
+              );
+
+              if (confirm.toLowerCase() === "yes") {
+                await applyEdit(proposal);
+              } else {
+                console.log(
+                  chalk.red("❌ Change rejected, stopping compound action.")
+                );
+                currentEntry.outcome = "rejected";
+                currentEntry.context = "User rejected a step";
+                return; // Exit the entire compound action if user rejects any change
+              }
+            }
+          }
+
+          // Only reach here if all steps completed successfully
+          currentEntry.outcome = "accepted";
+          currentEntry.context = "Compound action completed";
+          return;
+        }
+
         // At this point TypeScript knows intent is an edit intent
         const editIntent = intent as z.infer<typeof editIntentSchema>;
 
@@ -139,29 +390,41 @@ console.log(chalk.green("🤖 Coding Agent ready. Type 'exit' to quit."));
         const validation = await validateEdit(proposal);
 
         if (!validation.isValid) {
-          console.log(chalk.red("❌ Validation failed:"));
-          validation.errors.forEach((err: string) => console.log(`  • ${err}`));
+          console.log(
+            boxen(
+              validation.errors.map((err) => chalk.red(`• ${err}`)).join("\n"),
+              {
+                padding: 1,
+                margin: 1,
+                borderColor: "red",
+                title: "❌ Validation Failed",
+                titleAlignment: "center",
+              }
+            )
+          );
           currentEntry.outcome = "rejected";
           currentEntry.context = "Validation failed";
           continue;
         }
 
         if (validation.warnings.length > 0) {
-          console.log(chalk.yellow("⚠️  Warnings:"));
-          validation.warnings.forEach((warn: string) =>
-            console.log(`  • ${warn}`)
+          console.log(
+            boxen(
+              validation.warnings
+                .map((warn) => chalk.yellow(`• ${warn}`))
+                .join("\n"),
+              {
+                padding: 1,
+                margin: 1,
+                borderColor: "yellow",
+                title: "⚠️  Warnings",
+                titleAlignment: "center",
+              }
+            )
           );
         }
 
-        console.log(
-          chalk.cyan(
-            `\n--- Proposed Change ---\n${proposal.original}\n=>\n${
-              proposal.replacement
-            }\n@ ${proposal.file}${
-              proposal.lineNumber ? `:${proposal.lineNumber}` : ""
-            }\n------------------------\n`
-          )
-        );
+        console.log(formatEditProposal(proposal));
 
         const feedback = await rl.question(
           "💬 Accept this change? [yes / no / critique]: "

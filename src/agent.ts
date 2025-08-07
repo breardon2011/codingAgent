@@ -5,6 +5,7 @@ import dotenv from "dotenv";
 import { readFile, writeFile } from "fs/promises";
 import { conversationHistory } from "./utils/conversationHistory";
 import { logger } from "./utils/logger";
+import { executeShellCommand, isCommandSafe } from "./commands/shell";
 
 // Load environment variables from .env file
 dotenv.config();
@@ -20,19 +21,32 @@ export const proposalSchema = z.object({
 
 export type ProposalType = z.infer<typeof proposalSchema>;
 
+// Update the action enum to include shell commands
 export const editIntentSchema = z
   .object({
     intentType: z.literal("edit"),
     action: z.enum([
-      "add_code", // For new additions
-      "modify_code", // For changes to existing code
-      "fix_error", // For error fixes
-      "refactor", // For restructuring
-      "config_change", // For configuration updates
+      "add_code",
+      "modify_code",
+      "fix_error",
+      "refactor",
+      "config_change",
+      "shell_command",
+      "compound_action", // Add this new action type
     ]),
     target: z.string(),
     description: z.string(),
-    // Remove newName as it's too specific
+    command: z.string().optional(),
+    steps: z
+      .array(
+        z.object({
+          action: z.enum(["add_code", "modify_code", "shell_command"]),
+          target: z.string(),
+          description: z.string(),
+          command: z.string().optional(),
+        })
+      )
+      .optional(),
   })
   .strict();
 
@@ -65,35 +79,45 @@ User input: "${prompt}"
 Classification rules:
 1. EDIT INTENT if the user wants to:
    - Modify, add, remove, or change code/files
-   - Fix errors or issues
+   - Fix errors or issues  
    - Implement features or functionality
    - Refactor or improve code
    - Configure settings or files
+   - Execute shell/terminal commands
    - Uses phrases like: "can you edit", "please add", "fix this", "change the", "update", "implement", "make it so"
+   - Command-like requests: "install", "run", "build", "start", "deploy", "test"
+
+   For compound actions that require multiple steps (like "add a web server"):
+   - Use action: "compound_action"
+   - Include steps array with each required step
+   - Example:
+     {
+       "intentType": "edit",
+       "action": "compound_action",
+       "target": "project",
+       "description": "Add web server",
+       "steps": [
+         {
+           "action": "shell_command",
+           "target": "terminal",
+           "description": "Install express",
+           "command": "pnpm add express"
+         },
+         {
+           "action": "add_code",
+           "target": "src/api_server.ts",
+           "description": "Create web server file"
+         }
+       ]
+     }
 
 2. QUESTION INTENT if the user wants to:
    - Understand how something works
    - Get explanations or information
    - Ask about concepts or processes
-   - Uses phrases like: "how does", "what is", "why does", "explain", "tell me about"
-
-Examples:
-"Can you edit these files to add logging?" → EDIT
-"Please add error handling to the API" → EDIT  
-"Fix the TypeScript errors" → EDIT
-"Make the button blue" → EDIT
-"Update the README with installation instructions" → EDIT
-"How does the authentication work?" → QUESTION
-"What is this function doing?" → QUESTION
-"Explain the error message" → QUESTION
-
-For EDIT intents, determine:
-- action: "add_code" (new functionality), "modify_code" (change existing), "fix_error" (fix issues), "refactor" (improve structure), "config_change" (settings/config)
-- target: relevant file/component/area (infer from context if not explicit)
-- description: what needs to be done
 
 Return JSON:
-EDIT: {"intentType": "edit", "action": "...", "target": "...", "description": "..."}
+EDIT: {"intentType": "edit", "action": "...", "target": "...", "description": "...", "steps": [...]}
 QUESTION: {"intentType": "question", "question": "..."}
 
 IMPORTANT: Return ONLY raw JSON, no markdown, no backticks.`,
@@ -247,6 +271,34 @@ export async function chatFallback(prompt: string) {
     prompt,
   });
   return result.text;
+}
+
+export async function executeCommand(intent: IntentType) {
+  if (
+    intent.intentType !== "edit" ||
+    intent.action !== "shell_command" ||
+    !intent.command
+  ) {
+    throw new Error("Invalid shell command intent");
+  }
+
+  // Check if the command is safe to execute
+  const safetyCheck = isCommandSafe(intent.command);
+  if (!safetyCheck.safe) {
+    throw new Error(`Unsafe command: ${safetyCheck.reason}`);
+  }
+
+  // Execute the command
+  const result = await executeShellCommand(intent.command, {
+    interactive: true, // Use interactive mode for better output handling
+    timeout: 60000, // Increase timeout for package installations
+  });
+
+  if (result.exitCode !== 0) {
+    throw new Error(`Command failed: ${result.stderr || result.stdout}`);
+  }
+
+  return result;
 }
 
 export async function applyEdit(edit: {
