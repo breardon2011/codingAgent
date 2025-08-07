@@ -3,6 +3,8 @@ import { openai } from "@ai-sdk/openai";
 import { z } from "zod";
 import dotenv from "dotenv";
 import { readFile, writeFile } from "fs/promises";
+import { conversationHistory } from "./utils/conversationHistory";
+import { logger } from "./utils/logger";
 
 // Load environment variables from .env file
 dotenv.config();
@@ -48,23 +50,53 @@ const intentSchema = z.discriminatedUnion("intentType", [
 
 export type IntentType = z.infer<typeof intentSchema>;
 
-export async function extractIntent(prompt: string): Promise<IntentType> {
+export async function extractIntentWithContext(
+  prompt: string
+): Promise<IntentType> {
+  const context = conversationHistory.getContextForPrompt();
+
   try {
     const result = await generateText({
       model: openai("gpt-4o"),
-      prompt: `Generate a JSON object classifying this input: "${prompt}"
+      prompt: `${context}Analyze this user input and classify it as either an edit intent or a question.
 
-IMPORTANT: Return ONLY a raw JSON object, no markdown, no backticks.
+User input: "${prompt}"
 
-For edits use:
-{"intentType": "edit", "action": "add_code" | "modify_code" | "fix_error" | "refactor" | "config_change", "target": "file", "description": "what to do"}
+Classification rules:
+1. EDIT INTENT if the user wants to:
+   - Modify, add, remove, or change code/files
+   - Fix errors or issues
+   - Implement features or functionality
+   - Refactor or improve code
+   - Configure settings or files
+   - Uses phrases like: "can you edit", "please add", "fix this", "change the", "update", "implement", "make it so"
 
-For questions use:
-{"intentType": "question", "question": "the query"}
+2. QUESTION INTENT if the user wants to:
+   - Understand how something works
+   - Get explanations or information
+   - Ask about concepts or processes
+   - Uses phrases like: "how does", "what is", "why does", "explain", "tell me about"
 
-Example:
-Input: "Add .pyc to gitignore"
-Output: {"intentType": "edit", "action": "config_change", "target": ".gitignore", "description": "add .pyc files to gitignore"}`,
+Examples:
+"Can you edit these files to add logging?" → EDIT
+"Please add error handling to the API" → EDIT  
+"Fix the TypeScript errors" → EDIT
+"Make the button blue" → EDIT
+"Update the README with installation instructions" → EDIT
+"How does the authentication work?" → QUESTION
+"What is this function doing?" → QUESTION
+"Explain the error message" → QUESTION
+
+For EDIT intents, determine:
+- action: "add_code" (new functionality), "modify_code" (change existing), "fix_error" (fix issues), "refactor" (improve structure), "config_change" (settings/config)
+- target: relevant file/component/area (infer from context if not explicit)
+- description: what needs to be done
+
+Return JSON:
+EDIT: {"intentType": "edit", "action": "...", "target": "...", "description": "..."}
+QUESTION: {"intentType": "question", "question": "..."}
+
+IMPORTANT: Return ONLY raw JSON, no markdown, no backticks.`,
     });
 
     const cleaned = result.text
@@ -73,12 +105,19 @@ Output: {"intentType": "edit", "action": "config_change", "target": ".gitignore"
       .trim();
 
     const parsed = JSON.parse(cleaned);
-    return intentSchema.parse(parsed);
+    const validated = intentSchema.parse(parsed);
+
+    // Log the classification for debugging
+    logger.debug("Intent classification", {
+      input: prompt,
+      classified: validated.intentType,
+      action: validated.intentType === "edit" ? validated.action : "N/A",
+    });
+
+    return validated;
   } catch (error) {
     console.error("Intent extraction error:", error);
-    if (error instanceof Error) {
-      console.error("Error details:", error.message);
-    }
+    logger.warn("Defaulting to question intent due to extraction error");
     return {
       intentType: "question",
       question: prompt,
@@ -86,25 +125,51 @@ Output: {"intentType": "edit", "action": "config_change", "target": ".gitignore"
   }
 }
 
-export async function proposeEdit(
+export async function proposeEditWithContext(
   intent: IntentType,
   match: any
 ): Promise<ProposalType> {
+  const context = conversationHistory.getContextForPrompt();
+  const relatedChanges = conversationHistory.getRelatedChanges(match.file);
+
+  let contextPrompt = context;
+  if (relatedChanges.length > 0) {
+    contextPrompt += `\nRecent changes to ${match.file}:\n`;
+    relatedChanges.slice(-3).forEach((change) => {
+      contextPrompt += `- ${change.userInput} → ${change.outcome}\n`;
+    });
+  }
+
+  // Type guard to ensure we have an edit intent
+  if (intent.intentType !== "edit") {
+    throw new Error(
+      "proposeEditWithContext can only be called with edit intents"
+    );
+  }
+
   try {
     const result = await generateText({
       model: openai("gpt-4o"),
-      prompt: `Generate a code change proposal as a JSON object.
+      prompt: `${contextPrompt}Generate a code change proposal based on this request.
 
-IMPORTANT: Return ONLY a raw JSON object, no markdown, no backticks.
+User Intent: ${JSON.stringify(intent)}
+Code Match: ${JSON.stringify(match)}
 
-For appending to files like .gitignore, use:
-{"file": ".gitignore", "original": "", "replacement": "*.pyc", "lineNumber": null, "explanation": "why"}
+Create a specific, actionable code change proposal. Consider whether this requires:
+- Creating a new file (original: "", lineNumber: null)
+- Modifying existing code (original: current code, lineNumber: specific line)
+- Adding to existing file (choose appropriate location)
 
-For modifying existing code, use:
-{"file": "path/to/file", "original": "existing code", "replacement": "new code", "lineNumber": 123, "explanation": "why"}
+Return JSON with this exact structure:
+{
+  "file": "path/to/target/file",
+  "original": "code to replace OR empty string for new files", 
+  "replacement": "new code content",
+  "lineNumber": number_or_null,
+  "explanation": "clear explanation of the change"
+}
 
-Context:
-${JSON.stringify({ intent, match }, null, 2)}`,
+IMPORTANT: Return ONLY the JSON object, no markdown, no backticks.`,
     });
 
     const cleaned = result.text
@@ -112,10 +177,13 @@ ${JSON.stringify({ intent, match }, null, 2)}`,
       .replace(/```\n?/g, "")
       .trim();
 
+    logger.debug("Raw AI response", { response: cleaned });
+
     const parsed = JSON.parse(cleaned);
     return proposalSchema.parse(parsed);
   } catch (error) {
     console.error("Proposal generation error:", error);
+    logger.error("Failed to generate proposal", { error, intent, match });
     throw error;
   }
 }
@@ -125,13 +193,52 @@ export async function reviseProposal(
   intent: IntentType,
   match: any
 ) {
-  const result = await generateText({
-    model: openai("gpt-4o"),
-    prompt: `Revise the previous code change based on this feedback: "${feedback}".\nIntent: ${JSON.stringify(
-      intent
-    )}.\nMatch: ${JSON.stringify(match)}.`,
-  });
-  return JSON.parse(result.text);
+  // Type guard to ensure we have an edit intent
+  if (intent.intentType !== "edit") {
+    throw new Error("reviseProposal can only be called with edit intents");
+  }
+
+  try {
+    const result = await generateText({
+      model: openai("gpt-4o"),
+      prompt: `Revise the code change based on this user feedback: "${feedback}"
+
+Original Intent: ${JSON.stringify(intent)}
+Code Match: ${JSON.stringify(match)}
+
+The user wants you to modify the proposal based on their feedback. Generate a revised code change that incorporates their suggestions.
+
+Return JSON with this exact structure:
+{
+  "file": "path/to/target/file",
+  "original": "code to replace OR empty string for new files", 
+  "replacement": "revised code content",
+  "lineNumber": number_or_null,
+  "explanation": "explanation of the revision"
+}
+
+IMPORTANT: Return ONLY the JSON object, no markdown, no backticks, no explanatory text.`,
+    });
+
+    const cleaned = result.text
+      .replace(/```json\n?/g, "")
+      .replace(/```\n?/g, "")
+      .trim();
+
+    logger.debug("Raw revision response", { response: cleaned });
+
+    const parsed = JSON.parse(cleaned);
+    return proposalSchema.parse(parsed);
+  } catch (error) {
+    console.error("Revision generation error:", error);
+    logger.error("Failed to generate revision", {
+      error,
+      feedback,
+      intent,
+      match,
+    });
+    throw error;
+  }
 }
 
 export async function chatFallback(prompt: string) {
