@@ -7,6 +7,8 @@ import {
 import { promisify } from "util";
 import { logger } from "../utils/logger";
 import type { Readable } from "stream";
+import path from "path";
+import crypto from "crypto";
 
 const execAsync = promisify(exec);
 
@@ -213,6 +215,14 @@ export function isCommandSafe(command: string): {
     return {
       safe: false,
       reason: `Command '${baseCommand}' is not in the allowed list`,
+    };
+  }
+
+  // Prevent arbitrary package-script execution (npm run / pnpm run etc.)
+  if (["npm", "yarn", "pnpm"].includes(baseCommand) && parts[1] === "run") {
+    return {
+      safe: false,
+      reason: "Running user-defined scripts is not allowed",
     };
   }
 

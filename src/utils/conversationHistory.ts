@@ -118,28 +118,22 @@ class ConversationHistory {
   }
 
   getContextForPrompt(): string {
-    const recent = this.getRecentContext(3);
+    const recent = this.getRecentContext(5);
     const patterns = this.getUserPatterns();
 
     let context = "";
-
-    if (recent.length > 0) {
-      context += "Recent conversation context:\n";
-      recent.forEach((entry) => {
-        context += `- ${entry.userInput} → ${entry.outcome}\n`;
+    if (recent.length) {
+      context += "Recent:\n";
+      recent.forEach((r) => {
+        context += `• ${r.userInput} → ${r.outcome}\n`;
       });
-      context += "\n";
     }
-
-    if (patterns.length > 0) {
-      context += "User patterns:\n";
-      patterns.forEach((pattern) => {
-        context += `- ${pattern}\n`;
-      });
-      context += "\n";
+    if (patterns.length) {
+      context += "\nPatterns:\n";
+      patterns.forEach((p) => (context += `• ${p}\n`));
     }
-
-    return context;
+    // hard cap to ~2k chars to keep prompt small
+    return context.slice(-2000);
   }
 }
 

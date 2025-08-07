@@ -6,6 +6,9 @@ import { readFile, writeFile } from "fs/promises";
 import { conversationHistory } from "./utils/conversationHistory";
 import { logger } from "./utils/logger";
 import { executeShellCommand, isCommandSafe } from "./commands/shell";
+import { getFileReference } from "./utils/fileReference";
+import path from "path";
+import crypto from "crypto";
 
 // Load environment variables from .env file
 dotenv.config();
@@ -37,9 +40,11 @@ export const editIntentSchema = z
     target: z.string(),
     description: z.string(),
     command: z.string().optional(),
+    // separate schema makes compound-step validation strict
     steps: z
       .array(
         z.object({
+          intentType: z.literal("edit"), // ensure each step is a valid sub-intent
           action: z.enum(["add_code", "modify_code", "shell_command"]),
           target: z.string(),
           description: z.string(),
@@ -172,12 +177,22 @@ export async function proposeEditWithContext(
   }
 
   try {
+    /* ── NEW: attach a file reference for the full file that matched ── */
+    let fileRef = "";
+    try {
+      const full = await readFile(match.file, "utf8");
+      fileRef = await getFileReference(full);
+    } catch {
+      /* ignore – best effort */
+    }
+
     const result = await generateText({
       model: openai("gpt-4o"),
       prompt: `${contextPrompt}Generate a code change proposal based on this request.
 
 User Intent: ${JSON.stringify(intent)}
 Code Match: ${JSON.stringify(match)}
+File Reference: ${fileRef}
 
 Create a specific, actionable code change proposal. Consider whether this requires:
 - Creating a new file (original: "", lineNumber: null)
@@ -223,12 +238,19 @@ export async function reviseProposal(
   }
 
   try {
+    let fileRef = "";
+    try {
+      const full = await readFile(match.file, "utf8");
+      fileRef = await getFileReference(full);
+    } catch {}
+
     const result = await generateText({
       model: openai("gpt-4o"),
       prompt: `Revise the code change based on this user feedback: "${feedback}"
 
 Original Intent: ${JSON.stringify(intent)}
 Code Match: ${JSON.stringify(match)}
+File Reference: ${fileRef}
 
 The user wants you to modify the proposal based on their feedback. Generate a revised code change that incorporates their suggestions.
 
@@ -308,44 +330,48 @@ export async function applyEdit(edit: {
   lineNumber: number | null;
 }) {
   try {
+    const projectRoot = process.cwd();
+    if (!path.resolve(edit.file).startsWith(projectRoot)) {
+      throw new Error("Edit path escapes project root");
+    }
+
     let content: string;
     try {
       content = await readFile(edit.file, "utf8");
-    } catch (error) {
-      // If file doesn't exist, start with empty content
+    } catch {
       content = "";
     }
 
-    const lines = content.split("\n");
+    let newContent: string;
 
-    // If lineNumber is null, append to the end
     if (edit.lineNumber === null) {
-      // If the file is not empty and doesn't end with newline, add one
-      if (content && !content.endsWith("\n")) {
-        lines.push("");
-      }
-      lines.push(edit.replacement);
+      // simple append
+      const needsNl = content && !content.endsWith("\n") ? "\n" : "";
+      newContent = content + needsNl + edit.replacement + "\n";
     } else {
-      // Replace existing content
+      // targeted replace; fall back to whole-file diff when multi-line
+      const lines = content.split("\n");
       const targetLine = lines[edit.lineNumber - 1];
-      if (!targetLine?.includes(edit.original)) {
-        throw new Error(
-          `Original content not found at specified line in ${edit.file}`
+
+      if (targetLine && targetLine.includes(edit.original)) {
+        lines[edit.lineNumber - 1] = targetLine.replace(
+          edit.original,
+          edit.replacement
         );
+        newContent = lines.join("\n");
+      } else {
+        const idx = content.indexOf(edit.original);
+        if (idx === -1) {
+          throw new Error("Original snippet not found in file");
+        }
+        newContent =
+          content.slice(0, idx) +
+          edit.replacement +
+          content.slice(idx + edit.original.length);
       }
-      lines[edit.lineNumber - 1] = targetLine.replace(
-        edit.original,
-        edit.replacement
-      );
     }
 
-    // Ensure file ends with a newline
-    const lastLine = lines[lines.length - 1];
-    if (lastLine && !lastLine.endsWith("\n")) {
-      lines.push("");
-    }
-
-    await writeFile(edit.file, lines.join("\n"), "utf8");
+    await writeFile(edit.file, newContent, "utf8");
 
     console.log(
       `✅ Change applied to ${edit.file}${
@@ -358,4 +384,8 @@ export async function applyEdit(edit: {
     }
     throw error;
   }
+}
+
+function sha256(text: string) {
+  return crypto.createHash("sha256").update(text).digest("hex");
 }

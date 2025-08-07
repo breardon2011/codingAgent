@@ -1,5 +1,6 @@
 import { readdir, readFile, stat } from "fs/promises";
 import path from "path";
+import crypto from "crypto";
 
 export interface SearchMatch {
   file: string;
@@ -15,12 +16,17 @@ export interface SearchOptions {
   description: string;
 }
 
+const fileCache: { list?: string[] } = {};
+
 export async function searchCodebase(
   keyword: string,
   options?: SearchOptions
 ): Promise<SearchMatch[]> {
   const cwd = process.cwd();
-  const files = await getAllFiles(cwd);
+  if (!fileCache.list) {
+    fileCache.list = await getAllFiles(cwd);
+  }
+  const files = fileCache.list;
   const matches: SearchMatch[] = [];
 
   for (const file of files) {
@@ -216,4 +222,8 @@ async function getAllFiles(dir: string): Promise<string[]> {
   } catch (error) {
     return [];
   }
+}
+
+function sha256(text: string) {
+  return crypto.createHash("sha256").update(text).digest("hex");
 }
