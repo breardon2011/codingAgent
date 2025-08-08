@@ -6,15 +6,14 @@ import {
   proposeEditWithContext as proposeEdit,
   reviseProposal,
   chatFallback,
+  applyEdit, // unified
 } from "./agent";
 import { searchCodebase, SearchMatch } from "./commands/search";
-import { applyEdit } from "./commands/file";
 import { validateEdit } from "./commands/validation";
 import { parseError, suggestFix } from "./commands/errorParser";
 import { logger } from "./utils/logger";
 import { conversationHistory } from "./utils/conversationHistory";
-import { z } from "zod";
-import { editIntentSchema } from "./agent";
+import type { EditIntent } from "./domain/intent";
 import { executeShellCommand, isCommandSafe } from "./commands/shell";
 import boxen from "boxen"; // We'll need to add this package
 import { diffLines } from "diff"; // We'll need to add this package
@@ -325,7 +324,7 @@ console.log(chalk.green("🤖 Coding Agent ready. Type 'exit' to quit."));
                 {
                   ...step,
                   intentType: "edit",
-                } as z.infer<typeof editIntentSchema>,
+                } as EditIntent,
                 matches[0]
               );
               console.log(formatEditProposal(proposal));
@@ -354,7 +353,7 @@ console.log(chalk.green("🤖 Coding Agent ready. Type 'exit' to quit."));
         }
 
         // At this point TypeScript knows intent is an edit intent
-        const editIntent = intent as z.infer<typeof editIntentSchema>;
+        const editIntent = intent as EditIntent;
 
         // Enhanced search with intent context
         const matches = await searchCodebase(editIntent.target, {

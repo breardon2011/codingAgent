@@ -1,6 +1,5 @@
 import { generateText } from "ai";
 import { openai } from "@ai-sdk/openai";
-import { z } from "zod";
 import dotenv from "dotenv";
 import { readFile, writeFile } from "fs/promises";
 import { conversationHistory } from "./utils/conversationHistory";
@@ -9,65 +8,18 @@ import { executeShellCommand, isCommandSafe } from "./commands/shell";
 import { getFileReference } from "./utils/fileReference";
 import path from "path";
 import crypto from "crypto";
+import {
+  proposalSchema,
+  type ProposalType,
+  type IntentType,
+} from "./domain/intent";
+import { classifyIntent } from "./services/intentClassifier";
+
+// Re-export types for test imports
+export type { ProposalType, IntentType } from "./domain/intent";
 
 // Load environment variables from .env file
 dotenv.config();
-
-// Define the proposal schema type
-export const proposalSchema = z.object({
-  file: z.string(),
-  original: z.string(),
-  replacement: z.string(),
-  lineNumber: z.number().nullable(),
-  explanation: z.string(),
-});
-
-export type ProposalType = z.infer<typeof proposalSchema>;
-
-// Update the action enum to include shell commands
-export const editIntentSchema = z
-  .object({
-    intentType: z.literal("edit"),
-    action: z.enum([
-      "add_code",
-      "modify_code",
-      "fix_error",
-      "refactor",
-      "config_change",
-      "shell_command",
-      "compound_action", // Add this new action type
-    ]),
-    target: z.string(),
-    description: z.string(),
-    command: z.string().optional(),
-    // separate schema makes compound-step validation strict
-    steps: z
-      .array(
-        z.object({
-          intentType: z.literal("edit"), // ensure each step is a valid sub-intent
-          action: z.enum(["add_code", "modify_code", "shell_command"]),
-          target: z.string(),
-          description: z.string(),
-          command: z.string().optional(),
-        })
-      )
-      .optional(),
-  })
-  .strict();
-
-const questionIntentSchema = z
-  .object({
-    intentType: z.literal("question"),
-    question: z.string(),
-  })
-  .strict();
-
-const intentSchema = z.discriminatedUnion("intentType", [
-  editIntentSchema,
-  questionIntentSchema,
-]);
-
-export type IntentType = z.infer<typeof intentSchema>;
 
 export async function extractIntentWithContext(
   prompt: string
@@ -75,75 +27,7 @@ export async function extractIntentWithContext(
   const context = conversationHistory.getContextForPrompt();
 
   try {
-    const result = await generateText({
-      model: openai("gpt-4o"),
-      prompt: `${context}Analyze this user input and classify it as either an edit intent or a question.
-
-User input: "${prompt}"
-
-Classification rules:
-1. EDIT INTENT if the user wants to:
-   - Modify, add, remove, or change code/files
-   - Fix errors or issues  
-   - Implement features or functionality
-   - Refactor or improve code
-   - Configure settings or files
-   - Execute shell/terminal commands
-   - Uses phrases like: "can you edit", "please add", "fix this", "change the", "update", "implement", "make it so"
-   - Command-like requests: "install", "run", "build", "start", "deploy", "test"
-
-   For compound actions that require multiple steps (like "add a web server"):
-   - Use action: "compound_action"
-   - Include steps array with each required step
-   - Example:
-     {
-       "intentType": "edit",
-       "action": "compound_action",
-       "target": "project",
-       "description": "Add web server",
-       "steps": [
-         {
-           "action": "shell_command",
-           "target": "terminal",
-           "description": "Install express",
-           "command": "pnpm add express"
-         },
-         {
-           "action": "add_code",
-           "target": "src/api_server.ts",
-           "description": "Create web server file"
-         }
-       ]
-     }
-
-2. QUESTION INTENT if the user wants to:
-   - Understand how something works
-   - Get explanations or information
-   - Ask about concepts or processes
-
-Return JSON:
-EDIT: {"intentType": "edit", "action": "...", "target": "...", "description": "...", "steps": [...]}
-QUESTION: {"intentType": "question", "question": "..."}
-
-IMPORTANT: Return ONLY raw JSON, no markdown, no backticks.`,
-    });
-
-    const cleaned = result.text
-      .replace(/```json\n?/g, "")
-      .replace(/```\n?/g, "")
-      .trim();
-
-    const parsed = JSON.parse(cleaned);
-    const validated = intentSchema.parse(parsed);
-
-    // Log the classification for debugging
-    logger.debug("Intent classification", {
-      input: prompt,
-      classified: validated.intentType,
-      action: validated.intentType === "edit" ? validated.action : "N/A",
-    });
-
-    return validated;
+    return await classifyIntent(prompt, context);
   } catch (error) {
     console.error("Intent extraction error:", error);
     logger.warn("Defaulting to question intent due to extraction error");
@@ -169,7 +53,6 @@ export async function proposeEditWithContext(
     });
   }
 
-  // Type guard to ensure we have an edit intent
   if (intent.intentType !== "edit") {
     throw new Error(
       "proposeEditWithContext can only be called with edit intents"
@@ -232,7 +115,6 @@ export async function reviseProposal(
   intent: IntentType,
   match: any
 ) {
-  // Type guard to ensure we have an edit intent
   if (intent.intentType !== "edit") {
     throw new Error("reviseProposal can only be called with edit intents");
   }

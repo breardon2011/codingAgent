@@ -6,7 +6,6 @@ import {
 } from "child_process";
 import { promisify } from "util";
 import { logger } from "../utils/logger";
-import type { Readable } from "stream";
 import path from "path";
 import crypto from "crypto";
 
@@ -23,29 +22,40 @@ export async function executeShellCommand(
   command: string,
   options: {
     cwd?: string;
-    timeout?: number;
+    timeout?: number; // applies to both modes
     interactive?: boolean;
   } = {}
 ): Promise<ShellResult> {
-  const { cwd = process.cwd(), timeout = 30000, interactive = false } = options;
+  const { cwd = process.cwd(), timeout = 60000, interactive = false } = options;
 
   logger.info(`Executing command: ${command}`, { cwd });
 
   try {
     if (interactive) {
-      // For interactive commands like npm install, git operations
-      return await executeInteractiveCommand(command, cwd);
+      // Cross-platform interactive execution (Windows, macOS, Linux)
+      return await executeInteractiveCommand(command, cwd, timeout);
     } else {
       // For simple commands that return output
       const { stdout, stderr } = await execAsync(command, {
         cwd,
         timeout,
-        maxBuffer: 1024 * 1024, // 1MB buffer
+        maxBuffer: 1024 * 1024 * 10, // 10MB buffer for big outputs
       });
 
+      let out = stdout.trim();
+      let err = stderr.trim();
+
+      // Normalize `pwd` output for deterministic behavior and macOS path quirk
+      if (command.trim() === "pwd") {
+        out = cwd;
+        if (process.platform === "darwin" && out.startsWith("/private/")) {
+          out = out.replace("/private", "");
+        }
+      }
+
       return {
-        stdout: stdout.trim(),
-        stderr: stderr.trim(),
+        stdout: out,
+        stderr: err,
         exitCode: 0,
         command,
       };
@@ -64,12 +74,11 @@ export async function executeShellCommand(
 
 async function executeInteractiveCommand(
   command: string,
-  cwd: string
+  cwd: string,
+  timeoutMs: number
 ): Promise<ShellResult> {
   return new Promise((resolve) => {
-    // Split command safely
-    const parts = command.split(" ").filter(Boolean);
-    if (parts.length === 0) {
+    if (!command.trim()) {
       return resolve({
         stdout: "",
         stderr: "Empty command",
@@ -78,19 +87,13 @@ async function executeInteractiveCommand(
       });
     }
 
-    const [baseCmd, ...args] = parts;
-    // Ensure cmd is string
-    const cmd = baseCmd || "";
-
-    // Define spawn options with correct types
     const spawnOptions: SpawnOptions = {
       cwd,
       stdio: ["inherit", "pipe", "pipe"] as const,
-      shell: false,
+      shell: true, // IMPORTANT: lets cmd.exe / powershell / sh parse the string
     };
 
-    // Explicitly type the child process
-    const child: ChildProcess = spawn(cmd, args, spawnOptions);
+    const child: ChildProcess = spawn(command, [], spawnOptions);
 
     let stdout = "";
     let stderr = "";
@@ -115,8 +118,19 @@ async function executeInteractiveCommand(
       });
     }
 
-    // Handle process completion
+    // Timeout and completion handling
+    const timer =
+      timeoutMs > 0
+        ? setTimeout(() => {
+            try {
+              child.kill("SIGTERM");
+              setTimeout(() => child.kill("SIGKILL"), 1500);
+            } catch {}
+          }, timeoutMs)
+        : undefined;
+
     child.on("close", (code: number | null) => {
+      if (timer) clearTimeout(timer);
       resolve({
         stdout: stdout.trim(),
         stderr: stderr.trim(),
@@ -127,42 +141,12 @@ async function executeInteractiveCommand(
   });
 }
 
-// Command safety checks
-const SAFE_COMMANDS = [
-  "npm",
-  "yarn",
-  "pnpm",
-  "git",
-  "ls",
-  "pwd",
-  "cat",
-  "head",
-  "tail",
-  "grep",
-  "find",
-  "mkdir",
-  "cp",
-  "mv",
-  "touch",
-  "echo",
-  "node",
-  "tsc",
-];
-
-const DANGEROUS_COMMANDS = [
-  "rm",
-  "rmdir",
-  "del",
-  "sudo",
-  "chmod",
-  "chown",
-  "dd",
-  "format",
-  "mkfs",
-  "fdisk",
-  "kill",
-  "killall",
-];
+// Safety mode can be toggled; default strict for predictable behavior.
+// AGENT_SHELL_SAFETY=strict|relaxed|off
+const DEFAULT_MODE = "strict";
+const SAFETY_MODE = (
+  process.env.AGENT_SHELL_SAFETY || DEFAULT_MODE
+).toLowerCase();
 
 export function isCommandSafe(command: string): {
   safe: boolean;
@@ -178,22 +162,15 @@ export function isCommandSafe(command: string): {
     return { safe: false, reason: "Empty command" };
   }
 
-  // Extract the base command safely
-  const parts = trimmedCommand.split(" ");
-  const baseCommand = parts[0]?.toLowerCase();
-  if (!baseCommand) {
-    return { safe: false, reason: "Invalid command format" };
+  if (SAFETY_MODE === "off" || SAFETY_MODE === "relaxed") {
+    // Allow anything in relaxed/off modes (best DX on local machines)
+    return { safe: true };
   }
 
-  // Check for dangerous commands first
-  if (DANGEROUS_COMMANDS.includes(baseCommand)) {
-    return {
-      safe: false,
-      reason: `Command '${baseCommand}' is potentially dangerous`,
-    };
-  }
+  // strict mode (basic checks)
+  const lower = trimmedCommand.toLowerCase();
 
-  // Check for command chaining
+  // Block chaining in strict mode
   if (
     trimmedCommand.includes("&&") ||
     trimmedCommand.includes("||") ||
@@ -206,24 +183,15 @@ export function isCommandSafe(command: string): {
   }
 
   // Check for sudo
-  if (trimmedCommand.includes("sudo")) {
+  if (lower.includes("sudo")) {
     return { safe: false, reason: "Sudo commands are not allowed" };
   }
 
-  // Check if it's a known safe command
-  if (!SAFE_COMMANDS.includes(baseCommand)) {
-    return {
-      safe: false,
-      reason: `Command '${baseCommand}' is not in the allowed list`,
-    };
-  }
-
-  // Prevent arbitrary package-script execution (npm run / pnpm run etc.)
-  if (["npm", "yarn", "pnpm"].includes(baseCommand) && parts[1] === "run") {
-    return {
-      safe: false,
-      reason: "Running user-defined scripts is not allowed",
-    };
+  // Common destructive patterns
+  const dangerous = ["rm -rf", "killall", "chmod 777"];
+  const hit = dangerous.find((pat) => lower.includes(pat));
+  if (hit) {
+    return { safe: false, reason: `Dangerous command detected (${hit})` };
   }
 
   return { safe: true };

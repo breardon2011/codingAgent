@@ -3,9 +3,12 @@ import { expect } from "chai";
 import { describe, it } from "mocha";
 import type { IntentType } from "../agent";
 
-describe("Intent Classification Evaluations", () => {
-  describe("Shell Commands", () => {
-    it("should classify npm commands correctly", async () => {
+describe("Intent Classification Evaluations", function () {
+  // Allow real LLM calls to complete
+  this.timeout(15000);
+
+  describe("Shell Commands", function () {
+    it("should classify npm commands correctly", async function () {
       const inputs = [
         "install express please",
         "can you install typescript",
@@ -22,7 +25,7 @@ describe("Intent Classification Evaluations", () => {
       }
     });
 
-    it("should classify git commands correctly", async () => {
+    it("should classify git commands correctly", async function () {
       const inputs = [
         "commit these changes",
         "can you stage all files",
@@ -39,8 +42,8 @@ describe("Intent Classification Evaluations", () => {
     });
   });
 
-  describe("Code Edits", () => {
-    it("should classify file modifications", async () => {
+  describe("Code Edits", function () {
+    it("should classify file modifications", async function () {
       const inputs = [
         "add a new route to the server",
         "update the README",
@@ -59,8 +62,8 @@ describe("Intent Classification Evaluations", () => {
     });
   });
 
-  describe("Questions", () => {
-    it("should classify questions correctly", async () => {
+  describe("Questions", function () {
+    it("should classify questions correctly", async function () {
       const inputs = [
         "how does this work?",
         "explain the authentication flow",

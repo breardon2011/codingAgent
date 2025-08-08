@@ -2,7 +2,10 @@ import { validateEdit } from "../commands/validation";
 import { expect } from "chai";
 import { describe, it } from "mocha";
 
-describe("Edit Validation Evaluations", () => {
+describe("Edit Validation Evaluations", function () {
+  // Allow real LLM calls to complete
+  this.timeout(15000);
+
   describe("File Operations", () => {
     it("should validate new file creation", async () => {
       const edit = {
@@ -10,6 +13,7 @@ describe("Edit Validation Evaluations", () => {
         original: "",
         replacement: "console.log('hello');",
         lineNumber: null,
+        explanation: "create file with a log",
       };
 
       const result = await validateEdit(edit);
@@ -22,6 +26,7 @@ describe("Edit Validation Evaluations", () => {
         original: "old code",
         replacement: "new code",
         lineNumber: 1,
+        explanation: "update existing code",
       };
 
       const result = await validateEdit(edit);
@@ -34,6 +39,7 @@ describe("Edit Validation Evaluations", () => {
         original: "",
         replacement: "malicious code",
         lineNumber: null,
+        explanation: "bad path",
       };
 
       const result = await validateEdit(edit);
