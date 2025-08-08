@@ -9,6 +9,9 @@ export const proposalSchema = z.object({
 });
 export type ProposalType = z.infer<typeof proposalSchema>;
 
+export const proposalsSchema = z.array(proposalSchema);
+export type ProposalsType = z.infer<typeof proposalsSchema>;
+
 export const editIntentSchema = z
   .object({
     intentType: z.literal("edit"),

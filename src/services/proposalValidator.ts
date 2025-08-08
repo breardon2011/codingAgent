@@ -75,7 +75,7 @@ async function callLLM(proposals: ProposalType[]): Promise<ValidationResult[]> {
     }))
   );
 
-  const prompt = `You are a strict code change validator. You are given an array of proposed file edits. Review each proposal for internal consistency and obvious mistakes. Do NOT rewrite code; just validate.
+  const prompt = `You are a strict but pragmatic code change validator. You are given an array of proposed file edits. Review each proposal for internal consistency and obvious mistakes. Do NOT rewrite code; just validate.
 
 Return ONLY a JSON array where each element corresponds to the input proposal at the same index and has this exact shape:
 {"isValid":boolean,"errors":string[],"warnings":string[]}
@@ -84,9 +84,12 @@ Validation guidelines:
 - Check that "file" looks like a project path (no traversal like ../).
 - If "lineNumber" is provided and "original" is empty, warn that location might be ambiguous.
 - If "original" is non-empty but not likely to be found verbatim in the target file, warn (best-effort).
-- For JSON or config-looking changes, if content seems malformed, mark invalid.
+ - For JSON or config-looking changes, if content seems malformed, mark invalid.
 - Flag obviously dangerous or destructive code/content if any slipped through.
 - Prefer warnings over hard failures unless it's clearly unsafe or malformed.
+- IMPORTANT: Do not mark new-file boilerplate as invalid. Minimal yet complete HTML documents, simple Node.js HTTP servers, or similar scaffolding are acceptable and should be VALID. If content appears short but plausible, WARN instead of failing.
+- Do not reject for being "placeholder" unless the content is literally empty or contains obvious placeholders like "TODO", "...", or "<placeholder>" without substantive code.
+ - Allow example/demo content (e.g., "Hello World", sample endpoints, example text) as VALID. At most emit a warning that it's example content. Do NOT fail proposals solely for being examples.
 
 Proposals:
 ${JSON.stringify(prepared, null, 2)}

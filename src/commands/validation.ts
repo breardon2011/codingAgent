@@ -18,3 +18,9 @@ export async function validateEdit(
     }
   );
 }
+
+export async function validateEdits(
+  edits: ProposalType[]
+): Promise<ValidationResult[]> {
+  return validateProposals(edits);
+}

@@ -1,7 +1,7 @@
 import { generateText } from "ai";
 import { openai } from "@ai-sdk/openai";
 import dotenv from "dotenv";
-import { readFile, writeFile } from "fs/promises";
+import { readFile, writeFile, mkdir } from "fs/promises";
 import { conversationHistory } from "./utils/conversationHistory";
 import { logger } from "./utils/logger";
 import { executeShellCommand, isCommandSafe } from "./commands/shell";
@@ -41,7 +41,7 @@ export async function extractIntentWithContext(
 export async function proposeEditWithContext(
   intent: IntentType,
   match: any
-): Promise<ProposalType> {
+): Promise<ProposalType[]> {
   const context = conversationHistory.getContextForPrompt();
   const relatedChanges = conversationHistory.getRelatedChanges(match.file);
 
@@ -71,27 +71,33 @@ export async function proposeEditWithContext(
 
     const result = await generateText({
       model: openai("gpt-4o"),
-      prompt: `${contextPrompt}Generate a code change proposal based on this request.
+      prompt: `${contextPrompt}Generate code change proposals based on this request.
 
 User Intent: ${JSON.stringify(intent)}
 Code Match: ${JSON.stringify(match)}
 File Reference: ${fileRef}
 
-Create a specific, actionable code change proposal. Consider whether this requires:
-- Creating a new file (original: "", lineNumber: null)
+Create specific, actionable code change proposals. Consider whether this requires:
+- Creating new files (original: "", lineNumber: null)
 - Modifying existing code (original: current code, lineNumber: specific line)
 - Adding to existing file (choose appropriate location)
 
-Return JSON with this exact structure:
+Important:
+- Propose edits ONLY for the current target file relevant to this match: ${
+        match.file
+      }.
+- Do NOT propose duplicates for the same file.
+
+Return ONLY raw JSON as ONE proposal object for this step, unless multiple edits in THIS SAME file are absolutely necessary (e.g., different lineNumber blocks). Prefer a single consolidated proposal per file.
+
+Each proposal must have exactly:
 {
   "file": "path/to/target/file",
   "original": "code to replace OR empty string for new files", 
   "replacement": "new code content",
   "lineNumber": number_or_null,
   "explanation": "clear explanation of the change"
-}
-
-IMPORTANT: Return ONLY the JSON object, no markdown, no backticks.`,
+}`,
     });
 
     const cleaned = result.text
@@ -102,7 +108,15 @@ IMPORTANT: Return ONLY the JSON object, no markdown, no backticks.`,
     logger.debug("Raw AI response", { response: cleaned });
 
     const parsed = JSON.parse(cleaned);
-    return proposalSchema.parse(parsed);
+    if (Array.isArray(parsed)) {
+      // Even if the model returns an array, keep only proposals for the match.file
+      const filtered = parsed.filter((p: any) => p && p.file === match.file);
+      const arr = (filtered.length ? filtered : parsed).map((p: any) =>
+        proposalSchema.parse(p)
+      );
+      return arr;
+    }
+    return [proposalSchema.parse(parsed)];
   } catch (error) {
     console.error("Proposal generation error:", error);
     logger.error("Failed to generate proposal", { error, intent, match });
@@ -114,7 +128,7 @@ export async function reviseProposal(
   feedback: string,
   intent: IntentType,
   match: any
-) {
+): Promise<ProposalType[]> {
   if (intent.intentType !== "edit") {
     throw new Error("reviseProposal can only be called with edit intents");
   }
@@ -128,24 +142,24 @@ export async function reviseProposal(
 
     const result = await generateText({
       model: openai("gpt-4o"),
-      prompt: `Revise the code change based on this user feedback: "${feedback}"
+      prompt: `Revise the code change(s) based on this user feedback: "${feedback}"
 
 Original Intent: ${JSON.stringify(intent)}
 Code Match: ${JSON.stringify(match)}
 File Reference: ${fileRef}
 
-The user wants you to modify the proposal based on their feedback. Generate a revised code change that incorporates their suggestions.
+Revise only the proposal for this same target file: ${
+        match.file
+      }. Do NOT introduce new files here.
 
-Return JSON with this exact structure:
+Return ONLY raw JSON, either an array of proposals or a single proposal. Each proposal must have:
 {
   "file": "path/to/target/file",
   "original": "code to replace OR empty string for new files", 
   "replacement": "revised code content",
   "lineNumber": number_or_null,
   "explanation": "explanation of the revision"
-}
-
-IMPORTANT: Return ONLY the JSON object, no markdown, no backticks, no explanatory text.`,
+}`,
     });
 
     const cleaned = result.text
@@ -156,7 +170,10 @@ IMPORTANT: Return ONLY the JSON object, no markdown, no backticks, no explanator
     logger.debug("Raw revision response", { response: cleaned });
 
     const parsed = JSON.parse(cleaned);
-    return proposalSchema.parse(parsed);
+    if (Array.isArray(parsed)) {
+      return parsed.map((p: any) => proposalSchema.parse(p));
+    }
+    return [proposalSchema.parse(parsed)];
   } catch (error) {
     console.error("Revision generation error:", error);
     logger.error("Failed to generate revision", {
@@ -253,6 +270,9 @@ export async function applyEdit(edit: {
       }
     }
 
+    // Ensure destination directory exists for new files/nested paths
+    await mkdir(path.dirname(edit.file), { recursive: true });
+
     await writeFile(edit.file, newContent, "utf8");
 
     console.log(
@@ -268,6 +288,11 @@ export async function applyEdit(edit: {
   }
 }
 
+export async function applyEdits(edits: ProposalType[]) {
+  for (const e of edits) {
+    await applyEdit(e);
+  }
+}
 function sha256(text: string) {
   return crypto.createHash("sha256").update(text).digest("hex");
 }
